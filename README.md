@@ -2,7 +2,7 @@
 ### Zentyal Server (Community/Development Edition, Samba4 AD DC) + pfSense Firewall/Filtering + Windows 11 Clients — 4-Room Lab Rollout
 
 **Prepared for:** A developer/programmer moving into a systems administration role
-**Scope:** Stand up a free, Linux-based Active Directory domain on top of a hypervisor already provisioned on the CCSE network, add pfSense to handle routing and web filtering (a gap in Zentyal's free edition), enforce strict student desktop restrictions, and back up user data to OneDrive/Microsoft 365.
+**Scope:** Stand up a free, Linux-based Active Directory domain on dedicated physical hardware on the CCSE network, add pfSense on its own physical box to handle routing and web filtering (a gap in Zentyal's free edition), enforce strict student desktop restrictions, and back up user data to OneDrive/Microsoft 365.
 
 > **How to read this guide if you're coming from software, not sysadmin work:** Most of what follows maps to concepts you already know. A **Domain Controller** is basically a centralized auth server (like an identity provider/OAuth server, but for Windows logins). A **GPO (Group Policy Object)** is Windows' built-in configuration-management system — think Ansible/Puppet, except it's pushed automatically to any machine that's a member of the right "group" (OU) every time it boots or every ~90 minutes. An **OU (Organizational Unit)** is just a folder/namespace you place user and computer accounts into so policies can target them. **Kerberos** is the token-based auth protocol AD runs on — same ideas as OAuth2 tokens with expiry, just older and UDP/TCP-native instead of HTTP. Keep these mappings in mind; they'll make the GUI screens much less mysterious. Throughout the guide, boxes like this one call out concepts worth pausing on.
 
@@ -12,9 +12,8 @@
 
 | Component | Choice | Reason |
 |---|---|---|
-| Hypervisor | Existing dedicated host at **192.168.4.4** on the CCSE network (assumed Proxmox VE — free, open-source; substitute your actual hypervisor if different) | Already provisioned for you; both pfSense and Zentyal will run as VMs on it |
-| Firewall / Router / Web Filter | **pfSense CE (Community Edition)**, as a VM on the hypervisor | Zentyal's **Community/Development Edition** has no built-in content/web filtering (that's a paid Zentyal "Gateway" add-on) — pfSense fills that gap for free and also becomes your inter-VLAN router |
-| Domain Controller | **Zentyal Server, Community/Development Edition only** (Ubuntu Server 22.04/24.04 LTS base) | Free forever, no subscription required, Samba4 AD-compatible, has a web GUI for the AD/file-sharing pieces we actually need |
+| Firewall / Router / Web Filter | **pfSense CE (Community Edition)**, installed directly on its own physical box, dual-NIC — WAN NIC on the CCSE network at **192.168.4.4**, LAN NIC facing the internal lab network | Zentyal's **Community/Development Edition** has no built-in content/web filtering (that's a paid Zentyal "Gateway" add-on) — pfSense fills that gap for free and also becomes your inter-VLAN router. No hypervisor involved — bare metal, one box, two NICs. |
+| Domain Controller | **Zentyal Server, Community/Development Edition only** (Ubuntu Server 22.04/24.04 LTS base), installed directly on its own physical box, single NIC, internal-network-only | Free forever, no subscription required, Samba4 AD-compatible, has a web GUI for the AD/file-sharing pieces we actually need. Kept on a separate physical machine from pfSense so a reboot/patch of one never takes the other down. |
 | Directory Service | Samba4 AD DC (behind Zentyal's "Domain Controller" module) | Fully interoperable with Windows 11 domain-join, GPOs, Kerberos |
 | Internal DNS | Zentyal-managed BIND9, integrated with Samba AD | Required for Kerberos/AD to function — this is non-negotiable, not optional |
 | Clients | Windows 11 **Pro** or **Education** (Home edition **cannot** domain-join) | Domain join requires Pro/Education |
@@ -38,61 +37,71 @@ Because the free edition has no content-filtering module, **web filtering moves 
 ```
 CCSE Network (192.168.4.0/24, campus-managed)
         │
-        │  physical hypervisor host: 192.168.4.4
+        │  WAN NIC — physical pfSense box: 192.168.4.4
         ▼
-┌───────────────────────────────────────────────────────────┐
-│  Hypervisor (e.g. Proxmox VE) — 192.168.4.4                │
-│                                                             │
-│   ┌───────────────┐        ┌───────────────────────────┐  │
-│   │ pfSense VM    │        │ Zentyal AD DC VM           │  │
-│   │ WAN: 192.168. │        │ 10.0.0.2 (static)           │  │
-│   │  4.5 (example,│        │ Samba4 + BIND9 + web GUI    │  │
-│   │  confirm with │        │ :8443                       │  │
-│   │  network team)│        │                             │  │
-│   │ LAN: 10.0.0.1 ├────────┤ Gateway/DNS points to        │  │
-│   │  (router +    │        │ 10.0.0.1                    │  │
-│   │  DHCP + web   │        │                             │  │
-│   │  filter)      │        └───────────────────────────┬─┘  │
-│   └───────┬───────┘                                    │    │
-└───────────┼──────────────────────────────────────────────────┘
-            │ (802.1Q trunk down to the lab switch)
-   ┌────────┴─────────┬─────────────┬─────────────┐
+┌───────────────────────────┐
+│  pfSense box (bare metal) │
+│  WAN: 192.168.4.4          │
+│  LAN: 10.0.0.1              ├────────────────┐
+│  (router + DHCP + web       │                │
+│   filter, dual NIC)         │                │
+└───────────┬───────────────┘                │
+            │ (802.1Q trunk down to the       │
+            │  lab switch)                    │
+   ┌────────┴─────────┬─────────────┬─────────┐│
 Room 1 (VLAN 10)  Room 2 (VLAN 20) Room 3 (VLAN 30) Room 4 (VLAN 40)
 10.0.10.0/24       10.0.20.0/24     10.0.30.0/24      10.0.40.0/24
+                                                       │
+                                          ┌────────────┘
+                                          ▼
+                              ┌───────────────────────────┐
+                              │  Zentyal box (bare metal)  │
+                              │  Single NIC, internal-only │
+                              │  10.0.0.2 (static)         │
+                              │  Samba4 + BIND9 + web GUI  │
+                              │  :8443                     │
+                              │  Gateway/DNS forwarder      │
+                              │  points to 10.0.0.1         │
+                              └───────────────────────────┘
 ```
 
-Key differences from a "flat" design:
+Two separate physical machines, no hypervisor:
 
+- **pfSense box** — dual network interface cards. NIC1 plugs into the CCSE network (WAN, `192.168.4.4`, already assigned to you). NIC2 plugs into the internal lab switch (LAN, `10.0.0.1`), trunked with 802.1Q tags for the four room VLANs plus the untagged `10.0.0.0/24` segment where Zentyal lives.
+- **Zentyal box** — a single NIC, plugged only into the internal lab switch (never directly onto the CCSE network), static IP `10.0.0.2`, gateway `10.0.0.1`.
 - **pfSense is the router and DHCP server** for all four room VLANs. Zentyal is *not* your DHCP server in this design (it can technically do DHCP, but centralizing it in pfSense keeps one tool responsible for one job — easier to reason about, easier to troubleshoot, and it's where the web filter needs to sit anyway to see all outbound traffic).
-- **Zentyal only needs to be reachable, not routing.** It sits on the LAN side (10.0.0.0/24) doing AD + DNS + file sharing.
+- **Zentyal only needs to be reachable, not routing.** It sits on the LAN side (`10.0.0.0/24`) doing AD + DNS + file sharing, nothing else.
 - Ports that must be allowed **from every room VLAN to Zentyal (10.0.0.2)** through pfSense's inter-VLAN firewall rules: 88 (Kerberos), 389/636 (LDAP/LDAPS), 445 (SMB), 53 (DNS), 123 (NTP). Write one firewall rule per port per VLAN (or one alias covering all four VLANs → one rule per port) — don't skip this, a domain join will fail in confusing ways if any one of these is silently blocked.
-- The **WAN-side IP for the pfSense VM** (192.168.4.5 in the diagram) is a placeholder. Since the hypervisor itself already occupies 192.168.4.4 on the CCSE network, you'll need a second free address on that same segment for pfSense's WAN interface — request one from whoever manages the CCSE network rather than guessing.
+- Since these are two separate physical machines, plan your physical rack/cabling now: pfSense needs a cable run to wherever the CCSE network drop is, plus a second cable to the lab switch trunk port; Zentyal only needs the one cable to that same lab switch.
 
 ---
 
-# MODULE 1 — Hypervisor VMs: pfSense and Zentyal
+# MODULE 1 — Physical Server Setup: pfSense and Zentyal
 
-> **Why this module exists that didn't exist before:** Because you already have a hypervisor dedicated at 192.168.4.4, both the firewall and the domain controller are just VMs you create on it, rather than separate physical boxes. If you're used to spinning up cloud instances (EC2, a DigitalOcean droplet, etc.), this is the same mental model — you're just doing it against local hardware instead of an API, at least until Module 7 where we script it.
+> **Why this module looks the way it does:** No hypervisor here — pfSense and Zentyal are each installed straight onto their own dedicated physical machine, the same way you'd rack a bare-metal server for anything else. If you're used to spinning up cloud instances, the mental model is different in one important way: there's no "create VM" API call to script later (see Module 7's caveats) — provisioning these two boxes is a one-time, hands-on install, and Ansible only takes over *after* the OS is on the disk.
 
-## 1.1 Confirm Hypervisor Networking Before Creating Anything
+## 1.1 Hardware and Cabling Checklist
 
-1. Log into the hypervisor's own management UI (e.g., Proxmox's web console at `https://192.168.4.4:8006`).
-2. Confirm there are (or create) **two virtual networks/bridges**:
-   - One bridged directly to the physical CCSE network NIC (this is your "WAN" bridge — pfSense's WAN interface plugs into this).
-   - One **internal-only** virtual switch/bridge, not connected to any physical NIC, which will carry `10.0.0.0/24` plus the four room VLANs (10, 20, 30, 40) as 802.1Q tags on the same bridge. In Proxmox this is a Linux Bridge with VLAN awareness enabled; other hypervisors call this a "private" or "internal" vSwitch with VLAN trunking.
-3. Write down the exact bridge/vSwitch names — you'll reference them by name when creating both VMs and later in Ansible/Terraform.
+Before touching either installer:
 
-## 1.2 Create the pfSense VM
+1. **pfSense box** needs **two physical NICs** (onboard + one add-in card is fine, or two onboard ports if the motherboard has them). Confirm both are recognized by checking the BIOS/UEFI POST screen or a Linux live-USB `ip link` listing before installing pfSense itself.
+2. **Zentyal box** needs **one physical NIC** — it never touches the CCSE network directly, only the internal lab switch.
+3. Cable plan:
+   - pfSense NIC1 → the CCSE network drop (this is the interface that will carry `192.168.4.4`).
+   - pfSense NIC2 → a **trunk port** on your lab switch (carries 802.1Q tags 10/20/30/40 for the four rooms, plus untagged traffic for `10.0.0.0/24`).
+   - Zentyal's single NIC → an **access port** on the same lab switch, untagged, on the `10.0.0.0/24` segment (i.e., not tagged into any of the four room VLANs — Zentyal serves all rooms centrally).
+   - Configure the trunk port and Zentyal's access port on the switch itself (VLAN membership, trunk allowed-VLAN list) before you boot either installer, so the interfaces come up on the right network from the start.
+4. Have installation media ready: burn or write each ISO to a USB stick (`dd`, Rufus, Balena Etcher — whichever you're used to), one per machine.
 
-1. Download the **pfSense CE (Community Edition)** ISO from the official Netgate site (free).
-2. Create a new VM on the hypervisor with:
-   - 2 vCPU, 2–4 GB RAM, 20 GB disk (pfSense is light; this is generous headroom)
-   - **Two virtual NICs**: NIC1 attached to the WAN bridge (physical/CCSE-facing), NIC2 attached to the internal LAN bridge (trunked for VLANs 10/20/30/40 plus untagged 10.0.0.0/24)
-3. Boot from the ISO and run the pfSense installer (accept defaults; it auto-detects the two NICs).
-4. At first boot, pfSense will ask you to assign WAN and LAN interfaces to the two NICs — match them to what you wired in step 2.
-5. Set:
-   - **WAN**: static IP on the CCSE segment (the address you requested from your network team, e.g. `192.168.4.5/24`), gateway = the CCSE network's existing gateway.
+## 1.2 Install pfSense on Bare Metal
+
+1. Download the **pfSense CE (Community Edition)** ISO from the official Netgate site (free) and write it to a USB stick.
+2. Boot the pfSense machine from the USB stick and run the installer (accept the defaults — it's a short, guided process).
+3. At first boot after install, pfSense's console menu will ask you to assign **WAN** and **LAN** to the two physical NICs — match them to how you cabled them in 1.1 (NIC1 = WAN/CCSE-facing, NIC2 = LAN/lab-facing).
+4. From the console menu (option 2, "Set interface IP address"), or once you can reach the web GUI, set:
+   - **WAN**: static IP `192.168.4.4/24` on the CCSE segment, gateway = the CCSE network's existing gateway.
    - **LAN**: `10.0.0.1/24` (this becomes the gateway address for everything behind pfSense, including Zentyal).
+5. From an admin machine on the internal network, browse to `https://10.0.0.1` to reach the pfSense web GUI for everything else in this module.
 
 ## 1.3 Configure VLANs and DHCP for the Four Rooms in pfSense
 
@@ -125,11 +134,11 @@ You have two common free approaches. Pick one:
 
 Start with Option A. It solves "we have no web filter at all" immediately; move to Option B only if a specific room/policy need (e.g., time-of-day rules) actually shows up.
 
-## 1.5 Create the Zentyal VM
+## 1.5 Prepare the Zentyal Box
 
-1. Same hypervisor, new VM: 2+ vCPU, 4+ GB RAM (Samba AD + BIND are not heavy, but give it room), 40+ GB disk.
-2. **Single virtual NIC**, attached to the internal LAN bridge, **untagged** (i.e., on `10.0.0.0/24`, not one of the room VLANs — Zentyal serves all rooms centrally, it doesn't belong to one).
-3. Continue to Module 2 for the actual Zentyal install — everything from here on is unchanged from a bare-metal deployment, just running inside this VM.
+1. Confirm its single NIC is cabled to the access port you configured in 1.1 — untagged, on `10.0.0.0/24`, not one of the room VLANs.
+2. Reasonable hardware baseline: 2+ CPU cores, 4+ GB RAM (Samba AD + BIND are not heavy, but give it room), 40+ GB disk.
+3. Continue to Module 2 for the actual Zentyal install.
 
 ---
 
@@ -138,9 +147,9 @@ Start with Option A. It solves "we have no web filter at all" immediately; move 
 ## 2.1 Download and Install Zentyal Server
 
 1. Download the **Zentyal Server Development/Community Edition ISO** (free) from the official Zentyal site — confirm you're on the free download page, not a "buy subscription" page. It ships as a customized Ubuntu Server LTS installer.
-2. Attach the ISO to the Zentyal VM created in Module 1.5 and boot from it.
+2. Write the ISO to a USB stick and boot the Zentyal box (prepared in Module 1.5) from it.
 3. Proceed through the standard Ubuntu-based installer:
-   - You can leave networking on DHCP for the install itself; you'll set the permanent static IP from the web GUI in step 2.3 below. (If your hypervisor's internal bridge has no DHCP server yet, just set `10.0.0.2/24`, gateway `10.0.0.1`, manually at this stage — either path works.)
+   - You can leave networking on DHCP for the install itself if pfSense is already up and handing out addresses on `10.0.0.0/24`; you'll set the permanent static IP from the web GUI in step 2.3 below. Otherwise, just set `10.0.0.2/24`, gateway `10.0.0.1`, manually at this stage — either path works.
    - Set hostname, e.g. `dc1`.
    - Create the initial local admin (Linux) user — this account logs into the web interface.
    - Let the installer finish disk partitioning and base package installation.
@@ -384,7 +393,7 @@ Zentyal's web GUI manages Samba/AD objects (users, groups, DNS) but has **no nat
 3. Enable and configure **"Allow silent account configuration"**, entering your school's **Microsoft 365 Tenant ID** (Microsoft 365 Admin Center → Settings → Org Settings → Organization Profile, or `Get-MgOrganization` in Microsoft Graph PowerShell).
 4. This makes OneDrive auto-configure using the signed-in Windows credential — no manual setup wizard for students. (Since these accounts are on-prem AD, not Azure AD-joined, students will still see one M365 login prompt unless you've deployed Entra Connect Sync — see the note below.)
 
-> **Hybrid-Identity Note:** Pure Samba4 AD accounts aren't automatically known to Microsoft 365/Entra ID. For OneDrive Silent Config and SSO to work seamlessly you need either (a) matching UPNs plus a **directory sync** solution (Azure AD Connect classically requires Windows Server — as a free alternative, run **Entra Connect Sync** from a small dedicated Windows VM on the same hypervisor), or (b) students entering their school M365 email/password once at first OneDrive login. Plan identity-matching (same username = same email prefix) during Module 3 account creation to simplify this later.
+> **Hybrid-Identity Note:** Pure Samba4 AD accounts aren't automatically known to Microsoft 365/Entra ID. For OneDrive Silent Config and SSO to work seamlessly you need either (a) matching UPNs plus a **directory sync** solution (Azure AD Connect classically requires Windows Server — as a free alternative, run **Entra Connect Sync** from a small dedicated Windows machine — a spare PC or a VM under whatever virtualization you may already have elsewhere is fine, it doesn't need to live on the pfSense/Zentyal hardware), or (b) students entering their school M365 email/password once at first OneDrive login. Plan identity-matching (same username = same email prefix) during Module 3 account creation to simplify this later.
 
 ## 5.4 GPO: Known Folder Move (KFM) + Files On-Demand
 
@@ -458,9 +467,9 @@ Because students can't install anything, all software deployment must be **admin
 
 ---
 
-# MODULE 7 — Infrastructure as Code (Terraform + Ansible)
+# MODULE 7 — Infrastructure as Code (Ansible)
 
-> **Why this module changed the most:** the original bare-metal design had nothing for Terraform to declare — there was no VM resource, just physical hardware. Now that everything (pfSense, Zentyal) lives on a hypervisor, Terraform has a real, useful job: **provisioning the VMs themselves.** Ansible still owns everything *inside* those VMs (Samba/AD object management, GPO-equivalent registry pushes, Windows client config). Think of it the way you'd split `terraform apply` (creates the EC2 instance) from a config-management run (installs and configures software on it) — same split here, just against your own hypervisor instead of AWS.
+> **Context for this environment:** both pfSense and Zentyal are bare metal, provisioned by hand off a USB stick in Module 1 — there's no VM resource for Terraform to declare, so it has little to do here (the same reasoning would flip if you ever add a hypervisor for something else later, e.g. to run a small Entra Connect Sync VM per Module 5's hybrid-identity note — Terraform's `azuread` provider could then manage the Microsoft 365 side, but that's outside this guide's scope). Ansible carries almost the whole stack instead: Samba/AD object management on Zentyal, the parts of pfSense its collection supports, and Windows 11 client configuration over WinRM.
 
 ## 7.0 Honest Caveats Before You Commit to This
 
@@ -470,16 +479,13 @@ Because students can't install anything, all software deployment must be **admin
   1. **Backup/Restore roundtrip** — build the GPO once by hand in `gpmc.msc`, `Backup-GPO` it to a folder, commit that folder to git, `Import-GPO` it onto fresh environments. Simple, but git diffs on the binary blobs are unreadable.
   2. **Granular registry-value management** — for the specific OneDrive/AppLocker settings this guide uses, push the exact registry values Ansible can read/diff. More "real IaC"; shown below for OneDrive. AppLocker specifically is better handled via its dedicated XML export/import cmdlets (`Export-AppLockerPolicy` / `Set-AppLockerPolicy`), also shown below.
 - **WinRM chicken-and-egg problem.** Ansible needs WinRM enabled to manage a Windows 11 client, but a freshly domain-joined PC doesn't have WinRM enabled by default. You need *one* bootstrap mechanism before Ansible can take over — either a GPO that enables the WinRM listener + firewall rule domain-wide (one-time, via `gpmc.msc`/RSAT, not Ansible), or Microsoft's `ConfigureRemotingForAnsible.ps1` run once per machine during imaging.
-- **pfSense config isn't Ansible-native either.** pfSense stores its entire config in one XML file (`/cfg/config.xml`). There's a community Ansible collection (`pfsensible.core`) that wraps some of this via the pfSense API/SSH, but it doesn't cover every screen (VLANs and package installs especially are still easiest done once by hand). Treat pfSense the same way as GPOs: script what the collection supports, and version-control an exported `config.xml` backup for the rest.
+- **pfSense config isn't Ansible-native either.** pfSense stores its entire config in one XML file (`/cfg/config.xml`). There's a community Ansible collection (`pfsensible.core`) that wraps some of this via the pfSense API/SSH, but it doesn't cover every screen (VLANs and package installs especially are still easiest done once by hand, as in Module 1.3/1.4). Treat pfSense the same way as GPOs: script what the collection supports, and version-control an exported `config.xml` backup for the rest.
+- **Both boxes are physical, single points of failure.** With no hypervisor underneath either machine, there's no snapshot/rollback safety net if an in-place Ubuntu or pfSense upgrade goes wrong — your restore path is a fresh install from USB plus this Ansible state, or a config/database backup you took beforehand. Back up Zentyal's Samba database (`samba-tool domain backup offline`) and pfSense's `config.xml` on a schedule, and store both off-box.
 
 ## 7.1 Repository Layout
 
 ```
 lab-iac/
-├── terraform/
-│   ├── main.tf                    # provider (Proxmox/other) + VM resources for pfSense & Zentyal
-│   ├── variables.tf               # hypervisor host (192.168.4.4), bridge names, IPs
-│   └── outputs.tf
 ├── ansible.cfg
 ├── inventory/
 │   ├── hosts.yml                  # dc1, pfsense, plus all lab PCs grouped by room
@@ -493,7 +499,7 @@ lab-iac/
 ├── roles/
 │   ├── zentyal_samba_dc/
 │   ├── ad_objects/
-│   ├── pfsense_baseline/          # VLANs, DHCP scopes, firewall aliases/rules, pfBlockerNG
+│   ├── pfsense_baseline/          # firewall aliases/rules; VLANs/DHCP/pfBlockerNG stay manual (Module 1)
 │   ├── windows_client_join/
 │   ├── onedrive_policy/
 │   ├── applocker_policy/
@@ -502,61 +508,14 @@ lab-iac/
 │   └── OneDrive-SilentConfig/     # raw Backup-GPO output, committed as-is
 ├── pfsense-backups/
 │   └── config.xml                 # exported pfSense config, committed for review/diff
+├── zentyal-backups/
+│   └── samba-backup.tar.bz2       # output of `samba-tool domain backup offline`, committed or shipped off-box
 └── site.yml
 ```
 
-## 7.2 Terraform: Provisioning the VMs
+## 7.2 Control Node Prerequisites
 
-If your hypervisor is Proxmox VE, the `bpg/proxmox` (or `Telmate/proxmox`) provider can create both VMs declaratively:
-
-```hcl
-# terraform/main.tf
-terraform {
-  required_providers {
-    proxmox = {
-      source  = "bpg/proxmox"
-      version = "~> 0.60"
-    }
-  }
-}
-
-provider "proxmox" {
-  endpoint = "https://192.168.4.4:8006/"
-  api_token = var.proxmox_api_token
-  insecure  = true # self-signed cert on a LAN-only management IP
-}
-
-resource "proxmox_virtual_environment_vm" "pfsense" {
-  name      = "pfsense-fw"
-  node_name = "pve" # your hypervisor's node name
-  cpu       { cores = 2 }
-  memory    { dedicated = 4096 }
-
-  network_device { bridge = var.wan_bridge }   # CCSE-facing
-  network_device { bridge = var.lan_bridge, vlan_id = null } # trunk, VLAN tagging handled inside pfSense
-
-  cdrom { file_id = "local:iso/pfSense-CE.iso" }
-  disk  { interface = "scsi0", size = 20 }
-}
-
-resource "proxmox_virtual_environment_vm" "zentyal" {
-  name      = "dc1"
-  node_name = "pve"
-  cpu       { cores = 2 }
-  memory    { dedicated = 4096 }
-
-  network_device { bridge = var.lan_bridge } # untagged, 10.0.0.0/24
-
-  cdrom { file_id = "local:iso/zentyal-server.iso" }
-  disk  { interface = "scsi0", size = 40 }
-}
-```
-
-Run once to stand up empty VMs; the actual OS install still happens interactively off the ISO the first time (Terraform provisions the VM shell, not what happens inside the installer wizard) — after that, Ansible takes over everything configuration-related, same division of labor as before.
-
-## 7.3 Control Node Prerequisites
-
-On the Linux machine that will *run* Ansible (can be the Zentyal VM itself, or a separate admin box):
+On the Linux machine that will *run* Ansible (can be the Zentyal box itself, or a separate admin machine on the internal network):
 
 ```bash
 pip install --user ansible pywinrm requests-ntlm requests-kerberos
@@ -565,7 +524,7 @@ ansible-galaxy collection install ansible.windows community.windows microsoft.ad
 
 `microsoft.ad` provides modules like `microsoft.ad.user`, `microsoft.ad.ou`, `microsoft.ad.group` that speak native AD/LDAP against **any** AD-compatible DC, including Samba4 — generally a better fit than hand-rolling `samba-tool` shell calls where the collection covers your use case; fall back to raw `samba-tool` for anything it doesn't support (e.g., initial domain provisioning).
 
-## 7.4 Data-Driven Source of Truth
+## 7.3 Data-Driven Source of Truth
 
 `data/students.yml`:
 ```yaml
@@ -601,7 +560,7 @@ rooms:
 
 Every account/computer this guide creates should come from these files, not manual GUI clicks, so `git diff` on this repo *is* your change log for who has access to what.
 
-## 7.5 Role: `zentyal_samba_dc` (Server Bootstrap)
+## 7.4 Role: `zentyal_samba_dc` (Server Bootstrap)
 
 ```yaml
 # roles/zentyal_samba_dc/tasks/main.yml
@@ -644,7 +603,7 @@ Every account/computer this guide creates should come from these files, not manu
 
 `ad_realm`, `ad_netbios`, `ad_admin_password` live in `inventory/group_vars/all.yml` (vault-encrypt the password: `ansible-vault encrypt_string`).
 
-## 7.6 Role: `pfsense_baseline` (VLANs, DHCP, Firewall Aliases, pfBlockerNG)
+## 7.5 Role: `pfsense_baseline` (Ongoing Firewall Aliases & Rules)
 
 ```yaml
 # roles/pfsense_baseline/tasks/main.yml
@@ -678,7 +637,7 @@ Every account/computer this guide creates should come from these files, not manu
 
 Because `pfsensible.core`'s coverage of every pfSense screen (VLAN creation, package installation like pfBlockerNG) is incomplete, treat **VLAN setup and package installs as one-time manual steps** (Module 1.3/1.4) and let this role manage only the ongoing, repetitive parts — firewall rules and aliases — that actually change as rooms/policies evolve.
 
-## 7.7 Role: `ad_objects` (OUs, Groups, Users from Data Files)
+## 7.6 Role: `ad_objects` (OUs, Groups, Users from Data Files)
 
 ```yaml
 # roles/ad_objects/tasks/main.yml
@@ -716,7 +675,7 @@ Because `pfsensible.core`'s coverage of every pfSense screen (VLAN creation, pac
 
 Repeat for `faculty.yml` targeting `Lab-Faculty`. Because every `command` task checks stderr for "already exists" before failing, re-running `ansible-playbook site.yml` after adding three new rows to `students.yml` only creates those three — safe to run every time you onboard students mid-term.
 
-## 7.8 Role: `windows_client_join` (WinRM-Managed Clients)
+## 7.7 Role: `windows_client_join` (WinRM-Managed Clients)
 
 `inventory/group_vars/windows_clients.yml`:
 ```yaml
@@ -762,7 +721,7 @@ ansible_password: "{{ vault_lab_admin_password }}"
   when: "'admin_workstations' in group_names"
 ```
 
-## 7.9 OneDrive Policy as Granular Registry State (True IaC, No Binary GPO Blob)
+## 7.8 OneDrive Policy as Granular Registry State (True IaC, No Binary GPO Blob)
 
 ```yaml
 # roles/onedrive_policy/tasks/main.yml
@@ -781,7 +740,7 @@ ansible_password: "{{ vault_lab_admin_password }}"
 
 `git blame` on this file tells you exactly who changed the tenant ID and when, which a GPO backup blob won't.
 
-## 7.10 AppLocker as Exported XML Policy
+## 7.9 AppLocker as Exported XML Policy
 
 ```yaml
 # roles/applocker_policy/tasks/main.yml
@@ -803,7 +762,7 @@ ansible_password: "{{ vault_lab_admin_password }}"
 
 `files/applocker-policy.xml` encodes exactly the rules from Module 6.2/6.2.1 (Program Files/Windows allow for everyone, wider allow scoped to the `Lab-Faculty` SID). Regenerate it whenever rules change via `Export-AppLockerPolicy -Xml` from a reference machine, then commit the diff for review before rolling out.
 
-## 7.11 Role: `software_push` (Faculty/Admin-Requested Course Software)
+## 7.10 Role: `software_push` (Faculty/Admin-Requested Course Software)
 
 ```yaml
 # roles/software_push/tasks/main.yml
@@ -816,23 +775,22 @@ ansible_password: "{{ vault_lab_admin_password }}"
 
 `room_software_list` is defined per room in `inventory/group_vars/`, so Room 3 (CAD lab) and Room 1 (intro programming) carry different package lists while sharing every other role.
 
-## 7.12 Running It & Keeping Drift in Check
+## 7.11 Running It & Keeping Drift in Check
 
 ```bash
-terraform -chdir=terraform apply             # only needed when hardware/VM topology changes
 ansible-playbook -i inventory/hosts.yml site.yml --vault-password-file .vault-pass
 ```
 
 - Run the Ansible playbook after **any** change to `data/*.yml` — new student, new faculty member, room reassignment.
 - Consider a nightly `cron` run in **check mode** (`--check --diff`) that emails you a drift report (e.g., someone manually added a local admin through a GUI) without applying changes automatically — a lightweight, free substitute for a full compliance/CI product.
 - Export pfSense's `config.xml` (**Diagnostics → Backup & Restore → Download configuration**) on a schedule too, and commit it to `pfsense-backups/` — it's your only real "diff" on firewall/filtering changes until `pfsensible.core`'s coverage grows.
-- If this grows beyond what cron + a shared terminal can manage, free self-hosted options for scheduled/triggered runs include **Semaphore UI** or **AWX** (upstream of Red Hat Ansible Automation Platform) — both installable on the same hypervisor as a small companion VM.
+- If this grows beyond what cron + a shared terminal can manage, free self-hosted options for scheduled/triggered runs include **Semaphore UI** or **AWX** (upstream of Red Hat Ansible Automation Platform) — both light enough to run as a small companion service on the Zentyal box itself, or on a third spare machine if you'd rather keep it separate.
 
 ---
 
 # ADMINISTRATOR'S CHEAT SHEET
 
-## Samba/Zentyal `samba-tool` Essentials (run on the Zentyal VM, as root/sudo)
+## Samba/Zentyal `samba-tool` Essentials (run on the Zentyal box, as root/sudo)
 
 ```bash
 # Domain / DC health
@@ -923,4 +881,4 @@ klist
 
 ---
 
-**Deployment Order Recap:** Module 1 (hypervisor VMs: pfSense + Zentyal, VLANs, DHCP, web filtering) → Module 2 (Zentyal domain provisioning) → Module 3 (accounts/OUs, incl. `Faculty` OU + `Lab-Faculty` group) → Module 4 (join all client PCs across four rooms) → Module 5 (OneDrive/backup policy) → Module 6 (local lockdown/AppLocker, incl. faculty local-admin + AppLocker exception) → Module 7 (wrap the VM layer in Terraform and everything else in Ansible, so re-running `site.yml` is how you onboard, patch, and audit going forward) → validate with the Cheat Sheet before handing the lab over to students and faculty.
+**Deployment Order Recap:** Module 1 (rack and cable both physical boxes, install pfSense + Zentyal bare metal, VLANs, DHCP, web filtering) → Module 2 (Zentyal domain provisioning) → Module 3 (accounts/OUs, incl. `Faculty` OU + `Lab-Faculty` group) → Module 4 (join all client PCs across four rooms) → Module 5 (OneDrive/backup policy) → Module 6 (local lockdown/AppLocker, incl. faculty local-admin + AppLocker exception) → Module 7 (wrap the ongoing config in Ansible, so re-running `site.yml` is how you onboard, patch, and audit going forward) → validate with the Cheat Sheet before handing the lab over to students and faculty.
